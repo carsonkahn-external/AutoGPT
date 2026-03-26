@@ -33,6 +33,7 @@ from backend.copilot.rate_limit import (
     acquire_reset_lock,
     check_rate_limit,
     get_daily_reset_count,
+    get_global_rate_limits,
     get_usage_status,
     increment_daily_reset_count,
     release_reset_lock,
@@ -73,13 +74,13 @@ from backend.util.settings import Settings
 
 settings = Settings()
 
+logger = logging.getLogger(__name__)
+
 config = ChatConfig()
 
 _UUID_RE = re.compile(
     r"^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$", re.I
 )
-
-logger = logging.getLogger(__name__)
 
 
 async def _validate_and_get_session(
@@ -431,11 +432,15 @@ async def get_copilot_usage(
     """Get CoPilot usage status for the authenticated user.
 
     Returns current token usage vs limits for daily and weekly windows.
+    Global defaults sourced from LaunchDarkly (falling back to config).
     """
+    daily_limit, weekly_limit = await get_global_rate_limits(
+        user_id, config.daily_token_limit, config.weekly_token_limit
+    )
     return await get_usage_status(
         user_id=user_id,
-        daily_token_limit=config.daily_token_limit,
-        weekly_token_limit=config.weekly_token_limit,
+        daily_token_limit=daily_limit,
+        weekly_token_limit=weekly_limit,
         rate_limit_reset_cost=config.rate_limit_reset_cost,
     )
 
@@ -712,12 +717,16 @@ async def stream_chat_post(
 
     # Pre-turn rate limit check (token-based).
     # check_rate_limit short-circuits internally when both limits are 0.
+    # Global defaults sourced from LaunchDarkly, falling back to config.
     if user_id:
         try:
+            daily_limit, weekly_limit = await get_global_rate_limits(
+                user_id, config.daily_token_limit, config.weekly_token_limit
+            )
             await check_rate_limit(
                 user_id=user_id,
-                daily_token_limit=config.daily_token_limit,
-                weekly_token_limit=config.weekly_token_limit,
+                daily_token_limit=daily_limit,
+                weekly_token_limit=weekly_limit,
             )
         except RateLimitExceeded as e:
             raise HTTPException(status_code=429, detail=str(e)) from e
