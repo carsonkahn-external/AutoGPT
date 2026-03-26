@@ -118,13 +118,13 @@ export function CopilotPage() {
   const hasInsufficientCredits =
     credits !== null && resetCost != null && credits < resetCost;
 
-  // Fall back to a toast when the credit-based reset feature is disabled or
-  // when the usage query fails (so the user still gets feedback).
+  // Fall back to a toast when the credit-based reset feature is disabled,
+  // billing is off, or when the usage query fails (so the user still gets
+  // feedback instead of an unusable reset dialog).
+  const resetFeatureAvailable =
+    hasUsage && (resetCost ?? 0) > 0 && isBillingEnabled;
   useEffect(() => {
-    if (
-      rateLimitMessage &&
-      (usageError || (hasUsage && (resetCost ?? 0) <= 0))
-    ) {
+    if (rateLimitMessage && (usageError || !resetFeatureAvailable)) {
       toast({
         title: "Usage limit reached",
         description: rateLimitMessage,
@@ -132,7 +132,7 @@ export function CopilotPage() {
       });
       dismissRateLimit();
     }
-  }, [rateLimitMessage, resetCost, hasUsage, usageError, dismissRateLimit]);
+  }, [rateLimitMessage, resetFeatureAvailable, usageError, dismissRateLimit]);
 
   if (isUserLoading || !isLoggedIn) {
     return (
@@ -212,7 +212,7 @@ export function CopilotPage() {
       )}
       <NotificationDialog />
       <RateLimitResetDialog
-        isOpen={!!rateLimitMessage && hasUsage && (resetCost ?? 0) > 0}
+        isOpen={!!rateLimitMessage && resetFeatureAvailable}
         onClose={dismissRateLimit}
         resetCost={resetCost ?? 0}
         resetMessage={rateLimitMessage ?? ""}
