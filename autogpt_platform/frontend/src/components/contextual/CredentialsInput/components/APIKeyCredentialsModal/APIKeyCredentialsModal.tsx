@@ -41,9 +41,15 @@ export function APIKeyCredentialsModal({
     return null;
   }
 
+  const dialogTitle = `Add new API key for ${providerName ?? ""}`;
+  const secretLabel = "API Key";
+  const namePlaceholder = "Enter a name for this API Key...";
+  const secretPlaceholder = "Enter API Key...";
+  const submitLabel = "Add API Key";
+
   return (
     <Dialog
-      title={`Add new API key for ${providerName ?? ""}`}
+      title={dialogTitle}
       controlled={{
         isOpen: open,
         set: (isOpen) => {
@@ -73,7 +79,7 @@ export function APIKeyCredentialsModal({
                   id="title"
                   label="Name"
                   type="text"
-                  placeholder="Enter a name for this API Key..."
+                  placeholder={namePlaceholder}
                   {...field}
                 />
               )}
@@ -85,9 +91,9 @@ export function APIKeyCredentialsModal({
                 <>
                   <Input
                     id="apiKey"
-                    label="API Key"
+                    label={secretLabel}
                     type="password"
-                    placeholder="Enter API Key..."
+                    placeholder={secretPlaceholder}
                     hint={
                       schema.credentials_scopes ? (
                         <FormDescription>
@@ -145,7 +151,7 @@ export function APIKeyCredentialsModal({
               loading={isSubmitting}
               disabled={isSubmitting}
             >
-              Add API Key
+              {submitLabel}
             </Button>
           </form>
         </Form>

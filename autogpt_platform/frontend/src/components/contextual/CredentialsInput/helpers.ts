@@ -104,7 +104,10 @@ const CREDENTIAL_TYPE_LABELS: Record<CredentialsType, string> = {
   host_scoped: "Headers",
 };
 
-export function getCredentialTypeLabel(type: CredentialsType): string {
+export function getCredentialTypeLabel(
+  type: CredentialsType,
+  _provider?: string,
+): string {
   return CREDENTIAL_TYPE_LABELS[type] ?? type;
 }
 
