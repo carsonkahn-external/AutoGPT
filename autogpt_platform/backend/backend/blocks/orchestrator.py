@@ -1,9 +1,24 @@
+import asyncio
 import logging
 import re
+import types
+import uuid as uuid_mod
 from collections import Counter
+from collections.abc import AsyncIterable, Sequence
 from concurrent.futures import Future
+from functools import partial
 from typing import TYPE_CHECKING, Any
 
+from claude_agent_sdk import (
+    AssistantMessage,
+    ClaudeAgentOptions,
+    ClaudeSDKClient,
+    ResultMessage,
+    TextBlock,
+    ToolUseBlock,
+    create_sdk_mcp_server,
+)
+from claude_agent_sdk import tool as sdk_tool
 from pydantic import BaseModel
 
 import backend.blocks.llm as llm
@@ -17,6 +32,7 @@ from backend.blocks._base import (
     BlockType,
 )
 from backend.blocks.agent import AgentExecutorBlock
+from backend.copilot.sdk.env import config as copilot_config
 from backend.data.dynamic_fields import (
     extract_base_field_name,
     get_dynamic_field_description,
@@ -28,6 +44,13 @@ from backend.data.model import NodeExecutionStats, SchemaField
 from backend.util import json
 from backend.util.clients import get_database_manager_async_client
 from backend.util.prompt import MAIN_OBJECTIVE_PREFIX
+from backend.util.tool_call_loop import (
+    LLMLoopResponse,
+    LLMToolCall,
+    ToolCallLoopResult,
+    ToolCallResult,
+    tool_call_loop,
+)
 
 if TYPE_CHECKING:
     from backend.data.graph import Link, Node
@@ -383,6 +406,16 @@ class OrchestratorBlock(Block):
             advanced=True,
             default=0,
         )
+        use_sdk_mode: bool = SchemaField(
+            title="Use Claude Agent SDK",
+            default=False,
+            description="Use Claude Agent SDK for tool orchestration. "
+            "Only supports Claude models via 'anthropic' or 'open_router' providers. "
+            "Requires valid API credentials (subscription mode not supported). "
+            "The SDK manages the conversation loop natively, "
+            "so 'Agent Mode Max Iterations' is ignored when this is enabled.",
+            advanced=True,
+        )
         conversation_compaction: bool = SchemaField(
             default=True,
             title="Context window auto-compaction",
@@ -472,6 +505,41 @@ class OrchestratorBlock(Block):
     def cleanup(s: str):
         """Clean up block names for use as tool function names."""
         return re.sub(r"[^a-zA-Z0-9_-]", "_", s).lower()
+
+    @staticmethod
+    def _build_tool_info_from_args(
+        tool_call_id: str,
+        tool_name: str,
+        tool_args: dict[str, Any],
+        tool_def: dict[str, Any],
+    ) -> ToolInfo:
+        """Build a ToolInfo from parsed tool call arguments and a tool definition.
+
+        Shared between the agent mode tool executor and the SDK MCP handler
+        to avoid duplicating the field-mapping + ToolInfo construction logic.
+        """
+        field_mapping = tool_def["function"].get("_field_mapping", {})
+        input_data: dict[str, Any] = {}
+        if "function" in tool_def and "parameters" in tool_def["function"]:
+            expected_args = tool_def["function"]["parameters"].get("properties", {})
+            for clean_name in expected_args:
+                original = field_mapping.get(clean_name, clean_name)
+                input_data[original] = tool_args.get(clean_name)
+
+        mock_tc = types.SimpleNamespace(
+            id=tool_call_id,
+            function=types.SimpleNamespace(
+                name=tool_name,
+                arguments=json.dumps(tool_args),
+            ),
+        )
+        return ToolInfo(
+            tool_call=mock_tc,
+            tool_name=tool_name,
+            tool_def=tool_def,
+            input_data=input_data,
+            field_mapping=field_mapping,
+        )
 
     @staticmethod
     async def _create_block_function_signature(
@@ -727,9 +795,9 @@ class OrchestratorBlock(Block):
         self,
         credentials: llm.APIKeyCredentials,
         input_data: Input,
-        current_prompt: list[dict],
+        current_prompt: list[dict[str, Any]],
         tool_functions: list[dict[str, Any]],
-    ):
+    ) -> Any:
         """
         Attempt a single LLM call with tool validation.
 
@@ -825,7 +893,7 @@ class OrchestratorBlock(Block):
         return resp
 
     def _process_tool_calls(
-        self, response, tool_functions: list[dict[str, Any]]
+        self, response: Any, tool_functions: list[dict[str, Any]]
     ) -> list[ToolInfo]:
         """Process tool calls and extract tool definitions, arguments, and input data.
 
@@ -884,9 +952,17 @@ class OrchestratorBlock(Block):
         return processed_tools
 
     def _update_conversation(
-        self, prompt: list[dict], response, tool_outputs: list | None = None
+        self,
+        prompt: list[dict[str, Any]],
+        response: Any,
+        tool_outputs: list[dict[str, Any]] | None = None,
     ):
-        """Update conversation history with response and tool outputs."""
+        """Update conversation history with response and tool outputs.
+
+        ``response`` must be an ``LLMResponse`` (from ``backend.blocks.llm``),
+        **not** an ``LLMLoopResponse``. The method accesses ``.raw_response``
+        and ``.reasoning`` attributes on the passed object.
+        """
         converted = _convert_raw_response_to_dict(response.raw_response)
 
         if isinstance(converted, list):
@@ -950,11 +1026,17 @@ class OrchestratorBlock(Block):
         node_exec_result = None
         final_input_data = None
 
+        # Merge static defaults from the target node with LLM-provided inputs.
+        # The LLM only passes values it decides to fill (e.g., "value"), but
+        # static defaults like "name" on Agent Output Blocks must be included
+        # so the execution record is complete for from_db() reconstruction.
+        merged_input_data = {**target_node.input_default, **raw_input_data}
+
         # Add all inputs to the execution
-        if not raw_input_data:
+        if not merged_input_data:
             raise ValueError(f"Tool call has no input data: {tool_call}")
 
-        for input_name, input_value in raw_input_data.items():
+        for input_name, input_value in merged_input_data.items():
             node_exec_result, final_input_data = await db_client.upsert_execution_input(
                 node_id=sink_node_id,
                 graph_exec_id=execution_params.graph_exec_id,
@@ -1023,20 +1105,159 @@ class OrchestratorBlock(Block):
             )
 
         except Exception as e:
-            logger.warning(f"Tool execution with manager failed: {e}")
+            logger.warning("Tool execution with manager failed: %s", e)
             # Return error response
             return _create_tool_response(
                 tool_call.id,
-                f"Tool execution failed: {str(e)}",
+                f"Tool execution failed: {e}",
                 responses_api=responses_api,
             )
 
+    async def _agent_mode_llm_caller(
+        self,
+        messages: list[dict[str, Any]],
+        tools: Sequence[Any],
+        *,
+        credentials: llm.APIKeyCredentials,
+        input_data: "OrchestratorBlock.Input",
+    ) -> LLMLoopResponse:
+        """LLM caller callback for agent mode: wraps _attempt_llm_call_with_validation."""
+        resp = await self._attempt_llm_call_with_validation(
+            credentials, input_data, messages, list(tools)
+        )
+        tool_calls = [
+            LLMToolCall(
+                id=tc.id,
+                name=tc.function.name,
+                arguments=tc.function.arguments,
+            )
+            for tc in (resp.tool_calls or [])
+        ]
+        return LLMLoopResponse(
+            response_text=resp.response,
+            tool_calls=tool_calls,
+            raw_response=resp,
+            prompt_tokens=resp.prompt_tokens,
+            completion_tokens=resp.completion_tokens,
+            reasoning=resp.reasoning,
+        )
+
+    async def _agent_mode_tool_executor(
+        self,
+        tool_call: LLMToolCall,
+        tools: Sequence[Any],
+        *,
+        execution_params: ExecutionParams,
+        execution_processor: "ExecutionProcessor",
+        use_responses_api: bool,
+    ) -> ToolCallResult:
+        """Tool executor callback for agent mode: wraps _execute_single_tool_with_manager."""
+        # Find tool definition
+        tool_def = next(
+            (t for t in tools if t["function"]["name"] == tool_call.name),
+            None,
+        )
+        if not tool_def and len(tools) == 1:
+            tool_def = tools[0]
+        if not tool_def:
+            return ToolCallResult(
+                tool_call_id=tool_call.id,
+                tool_name=tool_call.name,
+                content=f"Unknown tool: {tool_call.name}",
+                is_error=True,
+            )
+
+        try:
+            tool_args = json.loads(tool_call.arguments)
+        except (ValueError, TypeError) as e:
+            return ToolCallResult(
+                tool_call_id=tool_call.id,
+                tool_name=tool_call.name,
+                content=f"Invalid JSON arguments: {e}",
+                is_error=True,
+            )
+        tool_info = OrchestratorBlock._build_tool_info_from_args(
+            tool_call_id=tool_call.id,
+            tool_name=tool_call.name,
+            tool_args=tool_args,
+            tool_def=tool_def,
+        )
+
+        try:
+            result = await self._execute_single_tool_with_manager(
+                tool_info,
+                execution_params,
+                execution_processor,
+                responses_api=use_responses_api,
+            )
+            # Unwrap the tool content from the provider-specific envelope.
+            # _execute_single_tool_with_manager returns a full message dict
+            # (e.g. {"role":"tool","content":"..."} for Chat API,
+            #  or {"type":"function_call_output","output":"..."} for Responses API).
+            raw_content = result.get("content") or result.get("output")
+            if isinstance(raw_content, list):
+                # Anthropic format: [{"type":"tool_result","content":"..."}]
+                parts = [
+                    item.get("content", "")
+                    for item in raw_content
+                    if isinstance(item, dict)
+                ]
+                content = (
+                    "\n".join(str(p) for p in parts)
+                    if parts
+                    else "Tool executed successfully"
+                )
+            elif raw_content is not None:
+                content = str(raw_content)
+            else:
+                content = "Tool executed successfully"
+            tool_failed = content.startswith("Tool execution failed:")
+            return ToolCallResult(
+                tool_call_id=tool_call.id,
+                tool_name=tool_call.name,
+                content=content,
+                is_error=tool_failed,
+            )
+        except Exception as e:
+            logger.error("Tool execution failed: %s", e)
+            return ToolCallResult(
+                tool_call_id=tool_call.id,
+                tool_name=tool_call.name,
+                content=f"Error: {e}",
+                is_error=True,
+            )
+
+    def _agent_mode_conversation_updater(
+        self,
+        messages: list[dict[str, Any]],
+        response: LLMLoopResponse,
+        tool_results: list[ToolCallResult] | None = None,
+        *,
+        use_responses_api: bool = False,
+    ) -> None:
+        """Conversation updater callback for agent mode."""
+        tool_outputs = None
+        if tool_results:
+            tool_outputs = [
+                _create_tool_response(
+                    tr.tool_call_id,
+                    tr.content,
+                    responses_api=use_responses_api,
+                )
+                for tr in tool_results
+            ]
+            tool_outputs = _combine_tool_responses(tool_outputs)
+        # Pass the raw LLM response (not the LLMLoopResponse wrapper) —
+        # _update_conversation expects the provider response object that
+        # has .raw_response and .reasoning attributes.
+        self._update_conversation(messages, response.raw_response, tool_outputs)
+
     async def _execute_tools_agent_mode(
         self,
-        input_data,
-        credentials,
+        input_data: "OrchestratorBlock.Input",
+        credentials: llm.APIKeyCredentials,
         tool_functions: list[dict[str, Any]],
-        prompt: list[dict],
+        prompt: list[dict[str, Any]],
         graph_exec_id: str,
         node_id: str,
         node_exec_id: str,
@@ -1046,12 +1267,10 @@ class OrchestratorBlock(Block):
         execution_context: ExecutionContext,
         execution_processor: "ExecutionProcessor",
     ):
-        """Execute tools in agent mode with a loop until finished."""
+        """Execute tools in agent mode using the shared tool-calling loop."""
         max_iterations = input_data.agent_mode_max_iterations
-        iteration = 0
         use_responses_api = input_data.model.metadata.provider == "openai"
 
-        # Execution parameters for tool execution
         execution_params = ExecutionParams(
             user_id=user_id,
             graph_id=graph_id,
@@ -1062,79 +1281,368 @@ class OrchestratorBlock(Block):
             execution_context=execution_context,
         )
 
+        # Bind callbacks using functools.partial
+        bound_llm_caller = partial(
+            self._agent_mode_llm_caller,
+            credentials=credentials,
+            input_data=input_data,
+        )
+        bound_tool_executor = partial(
+            self._agent_mode_tool_executor,
+            execution_params=execution_params,
+            execution_processor=execution_processor,
+            use_responses_api=use_responses_api,
+        )
+        bound_conversation_updater = partial(
+            self._agent_mode_conversation_updater,
+            use_responses_api=use_responses_api,
+        )
+
         current_prompt = list(prompt)
 
-        while max_iterations < 0 or iteration < max_iterations:
-            iteration += 1
-            logger.debug(f"Agent mode iteration {iteration}")
+        last_iter_msg = None
+        if max_iterations > 0:
+            last_iter_msg = (
+                f"{MAIN_OBJECTIVE_PREFIX}This is your last iteration. "
+                "Try to complete the task with the information you have. "
+                "If you cannot fully complete it, provide a summary of what "
+                "you've accomplished and what remains to be done. "
+                "Prefer finishing with a clear response rather than making "
+                "additional tool calls."
+            )
 
-            # Prepare prompt for this iteration
-            iteration_prompt = list(current_prompt)
+        try:
+            loop_result = ToolCallLoopResult(response_text="", messages=current_prompt)
+            async for loop_result in tool_call_loop(
+                messages=current_prompt,
+                tools=tool_functions,
+                llm_call=bound_llm_caller,
+                execute_tool=bound_tool_executor,
+                update_conversation=bound_conversation_updater,
+                max_iterations=max_iterations,
+                last_iteration_message=last_iter_msg,
+            ):
+                # Yield intermediate tool calls so the UI can show progress.
+                # Only yield conversations when there are tool calls to report;
+                # the final conversation state is always emitted once after the
+                # loop (line below) to avoid duplicate yields when max_iterations
+                # is reached.
+                if loop_result.last_tool_calls:
+                    yield "conversations", loop_result.messages
+                for tc in loop_result.last_tool_calls:
+                    yield "tool_calls", {
+                        "name": tc.name,
+                        "arguments": tc.arguments,
+                    }
+        except Exception as e:
+            # Catch all errors (validation, network, API) so that the block
+            # surfaces them as user-visible output instead of crashing.
+            yield "error", str(e)
+            return
 
-            # On the last iteration, add a special system message to encourage completion
-            if max_iterations > 0 and iteration == max_iterations:
-                last_iteration_message = {
-                    "role": "system",
-                    "content": f"{MAIN_OBJECTIVE_PREFIX}This is your last iteration ({iteration}/{max_iterations}). "
-                    "Try to complete the task with the information you have. If you cannot fully complete it, "
-                    "provide a summary of what you've accomplished and what remains to be done. "
-                    "Prefer finishing with a clear response rather than making additional tool calls.",
-                }
-                iteration_prompt.append(last_iteration_message)
+        yield "finished", loop_result.response_text
+        yield "conversations", loop_result.messages
 
-            # Get LLM response
-            try:
-                response = await self._attempt_llm_call_with_validation(
-                    credentials, input_data, iteration_prompt, tool_functions
-                )
-            except Exception as e:
-                yield "error", f"LLM call failed in agent mode iteration {iteration}: {str(e)}"
-                return
+    def _create_graph_mcp_server(
+        self,
+        tool_functions: list[dict[str, Any]],
+        execution_params: ExecutionParams,
+        execution_processor: "ExecutionProcessor",
+    ):
+        """Create an MCP server from graph-connected tool functions.
 
-            # Process tool calls
-            processed_tools = self._process_tool_calls(response, tool_functions)
+        Converts the OpenAI-format tool signatures (from _create_tool_node_signatures)
+        into MCP tools that execute downstream blocks via _execute_single_tool_with_manager.
+        """
+        sdk_tools = []
+        for tf in tool_functions:
+            func_def = tf["function"]
+            tool_name = func_def["name"]
+            tool_desc = func_def.get("description", "")
+            tool_params = func_def.get(
+                "parameters", {"type": "object", "properties": {}}
+            )
 
-            # If no tool calls, we're done
-            if not processed_tools:
-                yield "finished", response.response
-                self._update_conversation(current_prompt, response)
-                yield "conversations", current_prompt
-                return
+            # Build input schema for MCP (same as tool_adapter.py pattern).
+            # Preserve additionalProperties to prevent hallucinated arguments.
+            input_schema: dict[str, Any] = {
+                "type": "object",
+                "properties": dict(tool_params.get("properties", {})),
+                "required": list(tool_params.get("required", [])),
+            }
+            if "additionalProperties" in tool_params:
+                input_schema["additionalProperties"] = tool_params[
+                    "additionalProperties"
+                ]
 
-            # Execute tools and collect responses
-            tool_outputs = []
-            for tool_info in processed_tools:
-                try:
-                    tool_response = await self._execute_single_tool_with_manager(
-                        tool_info,
-                        execution_params,
-                        execution_processor,
-                        responses_api=use_responses_api,
+            # Capture variables for closure
+            _tf = tf
+            _block = self
+
+            def _make_handler(_tool_func=_tf, _self=_block):
+                async def handler(args: dict[str, Any]) -> dict[str, Any]:
+                    func = _tool_func["function"]
+
+                    # Build ToolInfo using shared helper
+                    tool_info = OrchestratorBlock._build_tool_info_from_args(
+                        tool_call_id=f"sdk-{uuid_mod.uuid4().hex[:12]}",
+                        tool_name=func["name"],
+                        tool_args=args,
+                        tool_def=_tool_func,
                     )
-                    tool_outputs.append(tool_response)
-                except Exception as e:
-                    logger.error(f"Tool execution failed: {e}")
-                    # Create error response for the tool
-                    error_response = _create_tool_response(
-                        tool_info.tool_call.id,
-                        f"Error: {str(e)}",
-                        responses_api=use_responses_api,
-                    )
-                    tool_outputs.append(error_response)
 
-            tool_outputs = _combine_tool_responses(tool_outputs)
+                    try:
+                        result = await _self._execute_single_tool_with_manager(
+                            tool_info, execution_params, execution_processor
+                        )
+                        # result is a tool response dict with "content" key
+                        content = result.get("content", "Tool executed successfully")
+                        if isinstance(content, str):
+                            text = content
+                        else:
+                            text = json.dumps(content)
+                        tool_failed = text.startswith("Tool execution failed:")
+                        return {
+                            "content": [{"type": "text", "text": text}],
+                            "isError": tool_failed,
+                        }
+                    except Exception as e:
+                        logger.error("SDK tool execution failed: %s", e)
+                        return {
+                            "content": [{"type": "text", "text": f"Error: {e}"}],
+                            "isError": True,
+                        }
 
-            self._update_conversation(current_prompt, response, tool_outputs)
+                return handler
 
-            # Yield intermediate conversation state
-            yield "conversations", current_prompt
+            decorated = sdk_tool(tool_name, tool_desc, input_schema)(_make_handler())
+            sdk_tools.append(decorated)
 
-        # If we reach max iterations, yield the current state
-        if max_iterations < 0:
-            yield "finished", f"Agent mode completed after {iteration} iterations"
+        return create_sdk_mcp_server(
+            name="graph_tools",
+            version="1.0.0",
+            tools=sdk_tools,
+        )
+
+    async def _execute_tools_sdk_mode(
+        self,
+        input_data: "OrchestratorBlock.Input",
+        credentials: llm.APIKeyCredentials,
+        tool_functions: list[dict[str, Any]],
+        prompt: list[dict[str, Any]],
+        execution_params: ExecutionParams,
+        execution_processor: "ExecutionProcessor",
+    ):
+        """Execute tools using the Claude Agent SDK.
+
+        The SDK manages the conversation loop and tool calling natively.
+        Graph-connected blocks are exposed as MCP tools.
+        """
+        # Build MCP server from graph-connected tools
+        mcp_server = self._create_graph_mcp_server(
+            tool_functions, execution_params, execution_processor
+        )
+
+        # Build allowed tools list (MCP-prefixed names)
+        MCP_PREFIX = "mcp__graph_tools__"
+        allowed_tools = [
+            f"{MCP_PREFIX}{tf['function']['name']}" for tf in tool_functions
+        ]
+
+        # Disable ALL SDK built-in tools — only graph tools available.
+        # NOTE: This list must be kept in sync with the Claude Agent SDK's
+        # built-in tools. `allowed_tools` (above) is the primary restriction;
+        # this blocklist is a defense-in-depth measure.
+        disallowed_tools = [
+            "Bash",
+            "WebFetch",
+            "AskUserQuestion",
+            "Read",
+            "Write",
+            "Edit",
+            "Glob",
+            "Grep",
+            "Task",
+            "WebSearch",
+            "TodoWrite",
+        ]
+
+        # Build SDK env — provider-aware credential routing.
+        # SDK mode does not support subscription-mode (platform-managed credits).
+        # Use *credential* provider for routing (not model metadata provider),
+        # because a user may select an Anthropic model but route through OpenRouter.
+        provider = credentials.provider
+        if not credentials.api_key:
+            yield "error", (
+                "SDK mode requires direct API credentials and does not support "
+                "subscription mode. Please provide an Anthropic or OpenRouter API key."
+            )
+            return
+        api_key = credentials.api_key.get_secret_value()
+        if provider == "open_router":
+            # Route through OpenRouter proxy: set base URL + auth token,
+            # clear API key so the SDK uses AUTH_TOKEN instead.
+            or_base = (copilot_config.base_url or "https://openrouter.ai/api").rstrip(
+                "/"
+            )
+            if or_base.endswith("/v1"):
+                or_base = or_base[:-3]
+            sdk_env = {
+                "ANTHROPIC_BASE_URL": or_base,
+                "ANTHROPIC_AUTH_TOKEN": api_key,
+                "ANTHROPIC_API_KEY": "",  # force CLI to use AUTH_TOKEN
+            }
         else:
-            yield "finished", f"Agent mode completed after {max_iterations} iterations (limit reached)"
-        yield "conversations", current_prompt
+            # Direct Anthropic key
+            sdk_env = {"ANTHROPIC_API_KEY": api_key}
+
+        # Build SDK options
+        options = ClaudeAgentOptions(
+            system_prompt=input_data.sys_prompt or "",
+            mcp_servers={"graph_tools": mcp_server},
+            allowed_tools=allowed_tools,
+            disallowed_tools=disallowed_tools,
+            cwd="/tmp",
+            env=sdk_env,
+            model=input_data.model.value or None,
+        )
+
+        # Strip system messages from prompt — they're already passed via
+        # ClaudeAgentOptions.system_prompt to avoid sending them twice.
+        sdk_prompt = [p for p in prompt if p.get("role") != "system"]
+
+        # Build user message from prompt.
+        # The SDK's query() accepts a string or an async iterable of message dicts.
+        # For multi-turn conversations, pass the full history as an async iterable
+        # to preserve assistant replies, tool calls/results, and system messages.
+        has_multi_turn = any(p.get("role") in ("assistant", "tool") for p in sdk_prompt)
+        if has_multi_turn:
+
+            async def _prompt_iter():
+                for p in sdk_prompt:
+                    yield p
+
+            user_message: str | AsyncIterable[dict[str, Any]] = _prompt_iter()
+        else:
+            # Single-turn: collapse user content into one string
+            user_parts = []
+            for p in sdk_prompt:
+                if p.get("role") == "user" and p.get("content"):
+                    user_parts.append(str(p["content"]))
+            user_message = "\n\n".join(user_parts) if user_parts else input_data.prompt
+
+        # Run SDK client with heartbeat-safe message iteration.
+        # We must NOT cancel __anext__() mid-flight — doing so corrupts
+        # the SDK's internal anyio memory stream (same pattern as
+        # copilot/sdk/service.py:_iter_sdk_messages).
+
+        _HEARTBEAT_INTERVAL = 10.0  # seconds
+
+        response_parts: list[str] = []
+        conversation: list[dict[str, Any]] = list(prompt)  # Start with input prompt
+        total_prompt_tokens = 0
+        total_completion_tokens = 0
+
+        try:
+            async with ClaudeSDKClient(options=options) as client:
+                await client.query(user_message)
+
+                msg_iter = client.receive_response().__aiter__()
+                pending_task: asyncio.Task[Any] | None = None
+
+                async def _next_msg() -> Any:
+                    return await msg_iter.__anext__()
+
+                try:
+                    while True:
+                        if pending_task is None:
+                            pending_task = asyncio.create_task(_next_msg())
+
+                        done, _ = await asyncio.wait(
+                            {pending_task}, timeout=_HEARTBEAT_INTERVAL
+                        )
+
+                        if not done:
+                            # Heartbeat — SDK is still processing, keep waiting
+                            continue
+
+                        pending_task = None
+                        try:
+                            sdk_msg = done.pop().result()
+                        except StopAsyncIteration:
+                            break
+
+                        if isinstance(sdk_msg, AssistantMessage):
+                            text_parts = []
+                            tool_use_parts = []
+                            for content_block in sdk_msg.content:
+                                if isinstance(content_block, TextBlock):
+                                    text_parts.append(content_block.text)
+                                    response_parts.append(content_block.text)
+                                elif isinstance(content_block, ToolUseBlock):
+                                    raw_name = getattr(content_block, "name", "unknown")
+                                    # Strip MCP prefix for readability in
+                                    # conversation history.
+                                    clean_name = raw_name.removeprefix(MCP_PREFIX)
+                                    tool_use_parts.append(
+                                        {
+                                            "tool": clean_name,
+                                            "id": getattr(
+                                                content_block, "id", "unknown"
+                                            ),
+                                        }
+                                    )
+                            if text_parts or tool_use_parts:
+                                msg_content = "".join(text_parts)
+                                if tool_use_parts:
+                                    tool_summary = ", ".join(
+                                        t["tool"] for t in tool_use_parts
+                                    )
+                                    if msg_content:
+                                        msg_content += f"\n[Tool calls: {tool_summary}]"
+                                    else:
+                                        msg_content = f"[Tool calls: {tool_summary}]"
+                                conversation.append(
+                                    {
+                                        "role": "assistant",
+                                        "content": msg_content,
+                                    }
+                                )
+                        elif isinstance(sdk_msg, ResultMessage):
+                            if sdk_msg.usage:
+                                total_prompt_tokens += getattr(
+                                    sdk_msg.usage, "input_tokens", 0
+                                )
+                                total_completion_tokens += getattr(
+                                    sdk_msg.usage, "output_tokens", 0
+                                )
+                finally:
+                    if pending_task is not None and not pending_task.done():
+                        pending_task.cancel()
+                        try:
+                            await pending_task
+                        except (asyncio.CancelledError, StopAsyncIteration):
+                            pass
+        except Exception as e:
+            # Surface SDK errors as user-visible output instead of crashing,
+            # consistent with _execute_tools_agent_mode error handling.
+            yield "error", str(e)
+            return
+
+        response_text = "".join(response_parts)
+
+        # Track usage — llm_call_count=1 is approximate; the SDK manages
+        # its own multi-turn loop internally and only exposes aggregate usage.
+        self.merge_stats(
+            NodeExecutionStats(
+                input_token_count=total_prompt_tokens,
+                output_token_count=total_completion_tokens,
+                llm_call_count=1,
+            )
+        )
+
+        yield "finished", response_text
+        yield "conversations", conversation
 
     async def run(
         self,
@@ -1245,6 +1753,44 @@ class OrchestratorBlock(Block):
             )
 
         # Execute tools based on the selected mode
+        if input_data.use_sdk_mode:
+            # Validate — SDK mode only works with Claude models
+            provider = input_data.model.metadata.provider
+            model_name = input_data.model.value
+            # All Claude models have metadata.provider == "anthropic", but
+            # "open_router" is included defensively in case future models
+            # use a different metadata provider for the same Anthropic API.
+            if provider not in ("anthropic", "open_router"):
+                raise ValueError(
+                    f"SDK mode requires an Anthropic-compatible provider (got provider={provider}). "
+                    "Please select an Anthropic or OpenRouter provider, or disable SDK mode."
+                )
+            if not model_name.startswith("claude"):
+                raise ValueError(
+                    f"SDK mode only supports Claude models (got model={model_name}). "
+                    "Please select a Claude model, or disable SDK mode."
+                )
+            # SDK mode: Claude Agent SDK manages conversation + tool calling
+            execution_params = ExecutionParams(
+                user_id=user_id,
+                graph_id=graph_id,
+                node_id=node_id,
+                graph_version=graph_version,
+                graph_exec_id=graph_exec_id,
+                node_exec_id=node_exec_id,
+                execution_context=execution_context,
+            )
+            async for result in self._execute_tools_sdk_mode(
+                input_data=input_data,
+                credentials=credentials,
+                tool_functions=tool_functions,
+                prompt=prompt,
+                execution_params=execution_params,
+                execution_processor=execution_processor,
+            ):
+                yield result
+            return
+
         if input_data.agent_mode_max_iterations != 0:
             # In agent mode, execute tools directly in a loop until finished
             async for result in self._execute_tools_agent_mode(
