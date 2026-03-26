@@ -238,18 +238,20 @@ async def get_daily_reset_count(user_id: str) -> int | None:
 
 
 async def increment_daily_reset_count(user_id: str) -> None:
-    """Increment and track how many resets this user has done today."""
+    """Increment and track how many resets this user has done today.
+
+    Raises on Redis errors so callers know the count was not persisted.
+    This prevents users from silently bypassing ``max_daily_resets``
+    when Redis has a transient failure.
+    """
     now = datetime.now(UTC)
-    try:
-        redis = await get_redis_async()
-        key = f"{_RESET_COUNT_PREFIX}:{user_id}:{now.strftime('%Y-%m-%d')}"
-        pipe = redis.pipeline(transaction=True)
-        pipe.incr(key)
-        seconds_until_reset = int((_daily_reset_time(now=now) - now).total_seconds())
-        pipe.expire(key, max(seconds_until_reset, 1))
-        await pipe.execute()
-    except (RedisError, ConnectionError, OSError):
-        logger.warning("Redis unavailable for tracking reset count")
+    redis = await get_redis_async()
+    key = f"{_RESET_COUNT_PREFIX}:{user_id}:{now.strftime('%Y-%m-%d')}"
+    pipe = redis.pipeline(transaction=True)
+    pipe.incr(key)
+    seconds_until_reset = int((_daily_reset_time(now=now) - now).total_seconds())
+    pipe.expire(key, max(seconds_until_reset, 1))
+    await pipe.execute()
 
 
 async def record_token_usage(

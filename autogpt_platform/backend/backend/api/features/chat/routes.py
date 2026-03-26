@@ -532,7 +532,7 @@ async def reset_copilot_usage(
             daily_token_limit=daily_limit,
             weekly_token_limit=weekly_limit,
         )
-        if daily_limit > 0 and usage_status.daily.used < daily_limit:
+        if usage_status.daily.used < daily_limit:
             raise HTTPException(
                 status_code=400,
                 detail="You have not reached your daily limit yet.",
@@ -596,7 +596,19 @@ async def reset_copilot_usage(
             )
 
         # Track the reset count for daily cap enforcement.
-        await increment_daily_reset_count(user_id)
+        # increment_daily_reset_count raises on Redis errors so the count
+        # is never silently lost.  The reset itself already succeeded at
+        # this point, so we log at ERROR and continue rather than
+        # reverting the reset or charging the user twice.
+        try:
+            await increment_daily_reset_count(user_id)
+        except Exception:
+            logger.error(
+                "Failed to increment daily reset count for user %s "
+                "— reset succeeded but counter not updated",
+                user_id[:8],
+                exc_info=True,
+            )
     finally:
         await release_reset_lock(user_id)
 

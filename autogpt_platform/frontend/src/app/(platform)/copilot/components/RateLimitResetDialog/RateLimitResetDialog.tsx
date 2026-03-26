@@ -42,7 +42,7 @@ export function RateLimitResetDialog({
   // block a valid reset due to a stale client-side balance.
   useEffect(() => {
     if (isOpen) onCreditChange?.();
-  }, [isOpen]); // eslint-disable-line react-hooks/exhaustive-deps
+  }, [isOpen, onCreditChange]);
 
   // Whether to hide the reset button entirely
   const cannotReset = isWeeklyExhausted || hasInsufficientCredits;
